@@ -10,7 +10,6 @@
             display: inline-block;
         "
     >BayesianVLA</span>
-    <img src="./assets/TwinBrainVLA-logo.png" alt="logo" style="position: relative; top: -10px; margin-left: -2px; height: 40px;" />
     : Bayesian Decomposition of Vision Language Action Models via Latent Action Queries
 </h1>
 
@@ -44,7 +43,7 @@ Vision-Language-Action (VLA) models have shown promise in robot manipulation but
 ## 🏗️ Architecture
 
 <div align="center">
-  <img src="./assets/arch.svg" alt="BayesianVLA Framework" width="100%">
+  <img src="./assets/arch.png" alt="BayesianVLA Framework" width="100%">
 </div>
 
 ## 🙏 Acknowledgements
