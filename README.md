@@ -69,6 +69,53 @@ In current VLA training, goal-driven datasets often make language instructions h
 | QwenGR00T (Baseline) | 57.7% | 47.8% |
 | **LangForce (Ours)** | **66.5% (+8.8%)** | **50.4% (+2.6%)** |
 
+## 🚀 Training
+
+Our training pipeline is built upon the **StarVLA** framework. To get started, please follow the instructions below to set up the base environment.
+
+<details close>
+<summary><b>🛠 starVLA Environment Setup
+</b></summary>
+
+```bash
+# Clone the repo
+git clone https://github.com/starVLA/starVLA
+
+# Create conda environment
+conda create -n starVLA python=3.10 -y
+conda activate starVLA
+
+# Install requirements
+pip install -r requirements.txt
+
+# Install FlashAttention2
+pip install flash-attn --no-build-isolation
+
+# Install starVLA
+pip install -e .
+```
+
+⚠️ **Common Issues**
+flash-attn can be tricky to install because it must match your system’s CUDA toolkit (nvcc) and PyTorch versions. The `--no-build-isolation` flag resolves most issues, but on newer systems you may need to manually choose a compatible flash-attn version. Ensure your CUDA driver/toolkit and torch versions are aligned. Check your environment:
+
+```bash
+nvcc -V
+pip list | grep -E 'torch|transformers|flash-attn'
+```
+
+If issues persist, pick a flash-attn release that matches your versions (CUDA and torch) or ask chatGPT with searching function for help with the outputs above.
+
+We have verified that `flash-attn==2.7.4.post1` works well with nvcc versions `12.0` and `12.4`.
+
+</details>
+
+**Integration**
+
+1. **Register Framework**: Move `LangForce.py` into the starVLA/model/framework/ directory. This will automatically register LangForce as a supported framework within StarVLA.
+2. **Vocabulary Expansion**: LangForce utilizes Qwen3-VL and extends the vocabulary with specialized tokens that serve as Latent Action Queries. Run the provided example script `add_token.py` to update the tokenizer with these additional tokens.
+
+> LangForce is currently under active development. Feel free to check back frequently for updates and new features!
+
 ## 🙏 Acknowledgements
 
 We would like to thank the [starVLA](https://github.com/starVLA/starVLA) project for its inspiring work and open-source contributions. At the same time, we also express our gratitude to the following projects:
