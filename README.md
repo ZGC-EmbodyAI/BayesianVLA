@@ -66,8 +66,8 @@ In current VLA training, goal-driven datasets often make language instructions h
 
 | Method | SimplerEnv (Avg) | RoboCasa (Avg) |
 | :--- | :---: | :---: |
-| QwenGR00T (Baseline) | 55.2% | 47.8% |
-| **LangForce (Ours)** | **66.5% (+11.3%)** | **50.4% (+2.6%)** |
+| QwenGR00T (Baseline) | 57.7% | 47.8% |
+| **LangForce (Ours)** | **66.5% (+8.8%)** | **50.4% (+2.6%)** |
 
 ## 🙏 Acknowledgements
 
