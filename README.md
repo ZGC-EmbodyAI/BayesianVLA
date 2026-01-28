@@ -69,7 +69,7 @@ In current VLA training, goal-driven datasets often make language instructions h
 
 ## 🚀 Training
 
-We train our model based on the starVLA framework. Therefore, you first need to set up a starVLA environment.
+Our training pipeline is built upon the **StarVLA** framework. To get started, please follow the instructions below to set up the base environment.
 
 <details close>
 <summary><b>🛠 starVLA Environment Setup
