@@ -138,3 +138,6 @@ If you find this project or the dataset helpful, please cite:
       url={https://arxiv.org/abs/2601.15197}, 
 }
 ```
+
+## Star History
+[![Star History Chart](https://api.star-history.com/svg?repos=ZGC-EmbodyAI/LangForce&type=date&legend=top-left)](https://www.star-history.com/#ZGC-EmbodyAI/LangForce&type=date&legend=top-left)
