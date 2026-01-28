@@ -36,7 +36,7 @@
 
 ---
 
-> To distinguish our method from BayesVLA in the equally excellent paper '*Seeing to Act, Prompting to Specify: A Bayesian Factorization of Vision Language Action Policy*,' which focuses on CLIP-based two-stage training, we rename our approach [LangForce](https://github.com/ZGC-EmbodyAI/BayesianVLA) to better reflect our core motivation of explicitly forcing VLAs to acquire and utilize language information through dual-branch optimization
+> To distinguish our method from BayesVLA in the equally excellent paper '*Seeing to Act, Prompting to Specify: A Bayesian Factorization of Vision Language Action Policy*,' which focuses on CLIP-based two-stage training, we rename our approach [LangForce](https://github.com/ZGC-EmbodyAI/LangForce) to better reflect our core motivation of explicitly forcing VLAs to acquire and utilize language information through dual-branch optimization
 
 ## 📖 Abstract
 
