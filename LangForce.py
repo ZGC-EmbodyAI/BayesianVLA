@@ -4,8 +4,12 @@
 # Design and Merged by [Jinhui YE / HKUST University] in [2025].
 """
 Qwen-GR00T Framework
-A lightweight implementation that Qwen-VL + Flow-matching head to directly predict continuous actions
-Flow-matching header is copyright from GR00T N1.5,
+Qwen-VL + Flow-matching head to directly predict continuous actions
+
+LangForceV5:
+(1) Assert language span consistency between prior/post branches (token-level exact match)
+(2) Hard-token LLR + Shortcut gate
+(3) Optional detach of prior condition to avoid pushing backbone to vision-only shortcut
 """
 import sys
 from pathlib import Path
@@ -15,9 +19,10 @@ _workspace_root = Path(__file__).parent.parent.parent.parent
 if str(_workspace_root) not in sys.path:
     sys.path.insert(0, str(_workspace_root))
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
@@ -35,8 +40,8 @@ VISION_START_TOKEN_INDEX = 151652  # <|vision_start|>
 VISION_END_TOKEN_INDEX   = 151654  # <|vision_end|>
 IMAGE_TOKEN_INDEX        = 151655  # <|image_pad|>
 VIDEO_TOKEN_INDEX        = 151656  # <|video_pad|>
-IM_START_TOKEN_INDEX     = 151644 # <|im_start|>
-IM_END_TOKEN_INDEX       = 151645 # <|im_end|>
+IM_START_TOKEN_INDEX     = 151644  # <|im_start|>
+IM_END_TOKEN_INDEX       = 151645  # <|im_end|>
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
@@ -48,23 +53,18 @@ from starVLA.model.tools import FRAMEWORK_REGISTRY
 @FRAMEWORK_REGISTRY.register("LangForce")
 class LangForce(baseframework):
     """
-    from paper: LangForce: Bayesian Decomposition of Vision Language Action Models via Latent Action Queries (arXiv:2601.15197)
+    Dual-branch Bayesian VLA with:
+      - Prior branch: (V + A + L) => proposal-like p(a|v) head
+      - Posterior branch: (V + L + A) => pi(a|v,l)
+      - LLR regularizer: maximize log p(L|V,A_prior) - sg(log p(L|V))
+        with:
+          * Hard-token LLR (top-k hardest tokens under post)
+          * Shortcut gate (down-weight LLR when log p(L|V) is already very low)
+      - Optional detach prior cond (protect backbone from vision-only drift)
 
-    Bayesian VLA Training Forward Pass:
-
-    1. Priori Branch (V + action_query + L): learn dataset bias p(a|v)
-       - Extract A hidden -> DiT -> prior_loss
-
-    2. Posteriori Branch (V + L + action_query): learn true policy pi(a|v,l)
-       - Extract A hidden -> DiT -> main_loss
-
-    3. LLR term (named kl_loss for compatibility):
-       - maximize log p(L | V, A_prior) - sg(log p(L | V))
-       - Here log p(L|V) is obtained from (V + L + A) where L is before A in causal LM.
-       - Crucial: we compute language span by boundaries:
-           * last <|vision_end|> position
-           * action block start position
-           * user <|im_end|> position
+    Additionally:
+      - Training-time assertion: extracted language spans in prior/post must match exactly (token-level).
+        If mismatch => raise AssertionError with decoded spans.
     """
 
     def __init__(
@@ -91,12 +91,37 @@ class LangForce(baseframework):
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
 
-        # Bayesian VLA hyperparameters
-        self.kl_weight = self.config.framework.get("kl_weight", 0.1)            # LLR loss weight (maximize)
-        self.prior_loss_weight = self.config.framework.get("prior_loss_weight", 0.3)
+        # ===== Loss weights =====
+        self.kl_weight = float(self.config.framework.get("kl_weight", 0.1))  # maximize LLR via -kl_weight * kl_loss
+        self.prior_loss_weight = float(self.config.framework.get("prior_loss_weight", 0.3))
+
+
+        # ===== (0) training assert switch =====
+        self.assert_lang_span_match = bool(self.config.framework.get("assert_lang_span_match", True))
+
+        # ===== (1) detach prior cond switch =====
+        self.detach_prior_cond = bool(self.config.framework.get("detach_prior_cond", True))
+
+        # ===== (2) Hard-token LLR =====
+        self.use_hard_token_llr = bool(self.config.framework.get("use_hard_token_llr", True))
+        self.hard_token_k = int(self.config.framework.get("hard_token_k", 16))
+        assert self.hard_token_k > 0
+
+        # ===== (3) Shortcut gate =====
+        # gate computed from posterior language-span NLL: high NLL => log p(L|V) low => gate small
+        self.use_kl_gate = bool(self.config.framework.get("use_kl_gate", True))
+        self.kl_gate_momentum = float(self.config.framework.get("kl_gate_momentum", 0.99))
+        self.kl_gate_temp = float(self.config.framework.get("kl_gate_temp", 0.5))
+        self.kl_gate_tau_scale = float(self.config.framework.get("kl_gate_tau_scale", 0.7))  # scale EMA threshold
+        self.kl_gate_min = float(self.config.framework.get("kl_gate_min", 0.0))
+        self.kl_gate_max = float(self.config.framework.get("kl_gate_max", 1.0))
 
         # cache some special token ids from tokenizer lazily
         self._im_end_id = None
+
+        # EMA buffer for posterior language-span NLL
+        self.register_buffer("post_nll_ema", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("post_nll_ema_inited", torch.tensor(0, dtype=torch.uint8))
 
     # ---------------------------------------------------------------------
     # Token id helpers
@@ -113,18 +138,12 @@ class LangForce(baseframework):
             self._im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
     def _find_last_pos(self, seq_1d: torch.Tensor, token_id: int) -> int:
-        """
-        Return last position of token_id in seq_1d, else -1.
-        """
         idx = (seq_1d == int(token_id)).nonzero(as_tuple=True)[0]
         if idx.numel() == 0:
             return -1
         return int(idx[-1].item())
 
     def _find_first_pos_after(self, seq_1d: torch.Tensor, token_id: int, start: int) -> int:
-        """
-        Return first position >= start where seq_1d[pos]==token_id, else -1.
-        """
         if start < 0:
             start = 0
         sub = seq_1d[start:]
@@ -137,10 +156,6 @@ class LangForce(baseframework):
     # Action block helpers
     # ---------------------------------------------------------------------
     def _get_action_block_start(self, input_ids_1d: torch.Tensor, tokenizer) -> int:
-        """
-        Return first position of <|action_0|> and validate contiguous K tokens ending with <|action_{K-1}|>.
-        Return -1 if not found/invalid.
-        """
         self._ensure_action_token_ids(tokenizer)
         first_id = self.action_token_ids["first"]
         last_id = self.action_token_ids["last"]
@@ -164,10 +179,6 @@ class LangForce(baseframework):
         tokenizer,
         return_starts: bool = False,
     ):
-        """
-        Extract latent action query hidden states as [B, K, H].
-        Optionally also return action_block_start positions as [B].
-        """
         self._ensure_action_token_ids(tokenizer)
 
         B = hidden_states.shape[0]
@@ -186,57 +197,55 @@ class LangForce(baseframework):
         return out
 
     # ---------------------------------------------------------------------
-    # SHIFT-correct mean logp over a span (start inclusive, end exclusive)
+    # SHIFT-correct token-level NLL span
     # ---------------------------------------------------------------------
-    def _mean_logp_span(
+    def _token_nll_span(
         self,
         logits_1d: torch.Tensor,      # [S, V]
         input_ids_1d: torch.Tensor,   # [S]
         start: int,
         end: int,
-        ignore_ids: Optional[set] = None,
-    ) -> Optional[torch.Tensor]:
+        ignore_ids: Optional[Set[int]] = None,
+    ):
         """
-        Compute mean log p(tokens in [start,end)) with next-token alignment:
-          logits[pos] predicts input_ids[pos+1]
-        So token at position j uses logits[j-1] (requires j>0).
-
-        Returns mean logp (scalar tensor), or None if span empty/invalid.
+        Return (nll_vec, target_ids_vec) for tokens in [start,end),
+        using next-token alignment:
+          token at position j is scored by logits[j-1] (requires j>0).
         """
         if end <= start:
-            return None
+            return None, None
         S = int(input_ids_1d.shape[0])
         start = max(0, int(start))
         end = min(S, int(end))
         if end <= start:
-            return None
+            return None, None
 
-        # token positions j in [start,end) and j>0
         j = torch.arange(start, end, device=input_ids_1d.device, dtype=torch.long)
         j = j[j > 0]
         if j.numel() == 0:
-            return None
+            return None, None
 
         targets = input_ids_1d[j].long()
 
         if ignore_ids is not None and len(ignore_ids) > 0:
-            # filter out ignore token ids inside the span (rare but safe)
             keep = torch.ones_like(targets, dtype=torch.bool)
             for tid in ignore_ids:
                 keep &= (targets != int(tid))
             j = j[keep]
             if j.numel() == 0:
-                return None
+                return None, None
             targets = input_ids_1d[j].long()
 
         pred_pos = j - 1
         pred_logits = logits_1d[pred_pos].float()  # [T, V]
-        # Use CE for stability: logp = -CE
         nll = F.cross_entropy(pred_logits, targets, reduction="none")  # [T]
-        return (-nll).mean()
+        return nll, targets
 
     # ---------------------------------------------------------------------
-    # LLR / "KL" computation using vision_end + action boundaries (NO matching)
+    # Compute LLR with:
+    #   - strict span equality assertion (training)
+    #   - hard-token LLR (top-k)
+    #   - shortcut gate based on posterior NLL
     # ---------------------------------------------------------------------
     def _compute_language_llr_from_boundaries(
         self,
@@ -247,27 +256,13 @@ class LangForce(baseframework):
         priori_action_starts: torch.Tensor,     # [B]
         posteriori_action_starts: torch.Tensor, # [B]
     ) -> torch.Tensor:
-        """
-        LLR = mean log p(L | V, A_prior) - sg(mean log p(L | V))
-
-        Language span definition (per sample):
-          - posterior (V + L + A):
-              lang_start_post = last_pos(<|vision_end|>) + 1
-              lang_end_post   = action_start_post
-          - prior (V + A + L):
-              lang_start_prior = action_start_prior + K
-              lang_end_prior   = first_pos_after(<|im_end|>, lang_start_prior)  (fallback to seq end)
-
-        We also ignore a few special ids if they accidentally appear (pad/image/video/vision markers).
-        """
         tokenizer = self.qwen_vl_interface.processor.tokenizer
         self._ensure_im_end_id(tokenizer)
 
         pad_id = tokenizer.pad_token_id
-        ignore_ids = set()
+        ignore_ids: Set[int] = set()
         if pad_id is not None:
             ignore_ids.add(int(pad_id))
-        # safe ignores (should not appear in language span, but add anyway)
         ignore_ids.add(int(IMAGE_TOKEN_INDEX))
         ignore_ids.add(int(VIDEO_TOKEN_INDEX))
         ignore_ids.add(int(VISION_START_TOKEN_INDEX))
@@ -279,57 +274,125 @@ class LangForce(baseframework):
         K = self.num_latent_action_query
 
         llr_vals = []
+        post_nll_means = []
 
         for b in range(B):
             ids_prior = priori_input_ids[b]
-            ids_post = posteriori_input_ids[b]
+            ids_post  = posteriori_input_ids[b]
 
             a_start_prior = int(priori_action_starts[b].item())
-            a_start_post = int(posteriori_action_starts[b].item())
+            a_start_post  = int(posteriori_action_starts[b].item())
 
-            # ---- posterior language span: (vision_end+1) : action_start ----
+            # ===== prior language span: [action_end : im_end) =====
+            lang_start_prior = a_start_prior + K
+            if lang_start_prior >= ids_prior.shape[0]:
+                continue
+            im_end = self._find_first_pos_after(ids_prior, self._im_end_id, lang_start_prior)
+            lang_end_prior = im_end if im_end != -1 else int(ids_prior.shape[0])
+            if lang_end_prior <= lang_start_prior:
+                continue
+
+            # ===== post language span: [last(vision_end)+1 : action_start) =====
             v_end_post = self._find_last_pos(ids_post, VISION_END_TOKEN_INDEX)
             if v_end_post == -1:
                 continue
             lang_start_post = v_end_post + 1
             lang_end_post = a_start_post
-
-            # ---- prior language span: (action_end) : user_im_end ----
-            lang_start_prior = a_start_prior + K
-            if lang_start_prior >= ids_prior.shape[0]:
-                continue
-
-            im_end_pos = self._find_first_pos_after(ids_prior, self._im_end_id, lang_start_prior)
-            lang_end_prior = im_end_pos if im_end_pos != -1 else int(ids_prior.shape[0])
-
-            # basic sanity
             if lang_end_post <= lang_start_post:
                 continue
-            if lang_end_prior <= lang_start_prior:
-                continue
 
-            lp_prior = self._mean_logp_span(
+            # ===== (1) strict assertion: token-level equality =====
+            if self.training and self.assert_lang_span_match:
+                prior_span_ids = ids_prior[lang_start_prior:lang_end_prior]
+                post_span_ids  = ids_post[lang_start_post:lang_end_post]
+
+                if (prior_span_ids.numel() != post_span_ids.numel()) or (not torch.equal(prior_span_ids, post_span_ids)):
+                    # decode for human-readable debugging
+                    prior_text = tokenizer.decode(prior_span_ids.tolist())
+                    post_text  = tokenizer.decode(post_span_ids.tolist())
+
+                    raise AssertionError(
+                        "\n[LangForceV5] Language span mismatch detected!\n"
+                        f"Sample b={b}\n"
+                        f"PRIOR span idx: [{lang_start_prior}:{lang_end_prior}]  (len={prior_span_ids.numel()})\n"
+                        f"POST  span idx: [{lang_start_post}:{lang_end_post}]  (len={post_span_ids.numel()})\n"
+                        f"PRIOR span: {repr(prior_text)}\n"
+                        f"POST  span: {repr(post_text)}\n"
+                        f"PRIOR token ids (first 50): {prior_span_ids[:50].tolist()}\n"
+                        f"POST  token ids (first 50): {post_span_ids[:50].tolist()}\n"
+                        "This indicates your boundary-based language extraction is inconsistent (likely prompt/template issue)."
+                    )
+
+            # ===== (2) hard-token LLR needs token-level aligned targets =====
+            nll_prior, tok_prior = self._token_nll_span(
                 logits_1d=priori_logits[b],
                 input_ids_1d=ids_prior,
                 start=lang_start_prior,
                 end=lang_end_prior,
                 ignore_ids=ignore_ids,
             )
-            lp_post = self._mean_logp_span(
+            nll_post, tok_post = self._token_nll_span(
                 logits_1d=posteriori_logits[b],
                 input_ids_1d=ids_post,
                 start=lang_start_post,
                 end=lang_end_post,
                 ignore_ids=ignore_ids,
             )
-            if lp_prior is None or lp_post is None:
+            if nll_prior is None or nll_post is None:
                 continue
 
-            llr_vals.append(lp_prior - lp_post)
+            # record post nll mean for gate
+            post_nll_mean = nll_post.mean().detach()
+            post_nll_means.append(post_nll_mean)
+
+            # logp_prior - logp_post = (-nll_prior) - (-nll_post) = nll_post - nll_prior
+            if self.use_hard_token_llr:
+                # require same target token sequence
+                if tok_prior is None or tok_post is None or tok_prior.shape != tok_post.shape or (not torch.equal(tok_prior, tok_post)):
+                    # This should not happen if your spans match, but keep safe fallback.
+                    llr = (nll_post.mean() - nll_prior.mean())
+                else:
+                    k = min(self.hard_token_k, int(nll_post.numel()))
+                    if k <= 0:
+                        continue
+                    idx = torch.topk(nll_post.detach(), k=k, largest=True).indices
+                    llr = (nll_post[idx] - nll_prior[idx]).mean()
+            else:
+                llr = (nll_post.mean() - nll_prior.mean())
+
+            llr_vals.append(llr)
 
         if len(llr_vals) == 0:
             return torch.tensor(0.0, device=priori_logits.device, dtype=torch.float32)
-        return torch.stack(llr_vals).mean()
+
+        llr_vals_t = torch.stack(llr_vals).float()                 # [M]
+        post_nll_means_t = torch.stack(post_nll_means).float()     # [M]
+
+        # ===== (2) shortcut gate: update EMA threshold =====
+        if self.use_kl_gate and self.training:
+            batch_mean = post_nll_means_t.mean().detach()
+            with torch.no_grad():
+                if int(self.post_nll_ema_inited.item()) == 0:
+                    self.post_nll_ema.copy_(batch_mean)
+                    self.post_nll_ema_inited.fill_(1)
+                else:
+                    m = self.kl_gate_momentum
+                    self.post_nll_ema.copy_(m * self.post_nll_ema + (1.0 - m) * batch_mean)
+
+        # ===== gate computation =====
+        if self.use_kl_gate:
+            tau = (self.post_nll_ema.detach() * float(self.kl_gate_tau_scale))
+            temp = max(float(self.kl_gate_temp), 1e-6)
+            # high nll => log p(L|V) low => gate small
+            g = torch.sigmoid((tau - post_nll_means_t) / temp)
+            # optional clamp/scale
+            if self.kl_gate_min != 0.0 or self.kl_gate_max != 1.0:
+                g = float(self.kl_gate_min) + (float(self.kl_gate_max) - float(self.kl_gate_min)) * g
+        else:
+            g = torch.ones_like(post_nll_means_t)
+
+        # weighted LLR
+        return (g * llr_vals_t).mean()
 
     # ---------------------------------------------------------------------
     # Forward
@@ -338,8 +401,7 @@ class LangForce(baseframework):
         self,
         examples: List[dict] = None,
         **kwargs,
-    ) -> Tuple:
-        # print("begin Qwen_GR00T_with_Bayesian forward")
+    ) -> dict:
         batch_images = [example["image"] for example in examples]  # [B, [PIL...]]
         instructions_priori = [self.latent_action_query + example["lang"] for example in examples]       # A + L
         instructions_posteriori = [example["lang"] + self.latent_action_query for example in examples]  # L + A
@@ -359,6 +421,7 @@ class LangForce(baseframework):
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
+                use_cache=False,
             )
             priori_last_hidden = qwenvl_outputs_priori.hidden_states[-1]  # [B, S, H]
             priori_action_hidden, priori_action_starts = self._extract_action_query_hidden_states(
@@ -381,6 +444,7 @@ class LangForce(baseframework):
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
+                use_cache=False,
             )
             posteriori_last_hidden = qwenvl_outputs_posteriori.hidden_states[-1]  # [B, S, H]
             posteriori_action_hidden, posteriori_action_starts = self._extract_action_query_hidden_states(
@@ -390,10 +454,10 @@ class LangForce(baseframework):
                 return_starts=True
             )  # [B, K, H], [B]
 
-            # detach baseline logits: we don't want to worsen p(L|V) to inflate LLR
+            # detach baseline logits: do not allow worsening log p(L|V) to inflate LLR
             posteriori_logits = qwenvl_outputs_posteriori.logits.detach()  # [B, S, V]
 
-        # ===== Step 3: LLR loss (your "KL") computed by boundaries =====
+        # ===== Step 3: LLR loss (Hard-token + Gate + Assert) =====
         kl_loss = self._compute_language_llr_from_boundaries(
             priori_logits=priori_logits,
             posteriori_logits=posteriori_logits,
@@ -405,10 +469,10 @@ class LangForce(baseframework):
 
         # ===== Step 4: Action head losses =====
         with torch.autocast("cuda", dtype=torch.float32):
-            actions = torch.tensor(
+            actions_t = torch.tensor(
                 np.array(actions), device=priori_action_hidden.device, dtype=priori_action_hidden.dtype
             )
-            actions_target = actions[:, -(self.future_action_window_size + 1):, :]  # [B, chunk_len, action_dim]
+            actions_target = actions_t[:, -(self.future_action_window_size + 1):, :]  # [B, chunk_len, action_dim]
 
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
@@ -416,27 +480,38 @@ class LangForce(baseframework):
 
             state_tensor = None
             if state is not None:
-                state_tensor = torch.tensor(np.array(state), device=priori_action_hidden.device, dtype=priori_action_hidden.dtype)
+                state_tensor = torch.tensor(
+                    np.array(state), device=priori_action_hidden.device, dtype=priori_action_hidden.dtype
+                )
 
-            # Prior loss: condition on priori_action_hidden
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-            priori_cond = priori_action_hidden.repeat(repeated_diffusion_steps, 1, 1).float()
-            posteriori_cond = posteriori_action_hidden.repeat(repeated_diffusion_steps, 1, 1).float()
 
+            # (3) detach prior condition switch
+            if self.detach_prior_cond:
+                priori_cond_base = priori_action_hidden.detach()
+            else:
+                priori_cond_base = priori_action_hidden
+
+            priori_cond = priori_cond_base.repeat(repeated_diffusion_steps, 1, 1).float()
+            posteriori_cond = posteriori_action_hidden.repeat(repeated_diffusion_steps, 1, 1).float()
             state_repeated = state_tensor.repeat(repeated_diffusion_steps, 1, 1) if state_tensor is not None else None
 
             prior_loss = self.action_model(priori_cond, actions_target_repeated, state_repeated)
             main_loss = self.action_model(posteriori_cond, actions_target_repeated, state_repeated)
 
-        # total = main + prior_w * prior - kl_w * llr   (maximize llr)
-        total_loss = (1 - self.prior_loss_weight) * main_loss + self.prior_loss_weight * prior_loss - self.kl_weight * kl_loss
+        # ===== Step 5: Total loss (keep your preferred convex mixture) =====
+        total_loss = (
+            (1.0 - self.prior_loss_weight) * main_loss
+            + self.prior_loss_weight * prior_loss
+            - self.kl_weight * kl_loss
+        )
 
-        # print("End Qwen_GR00T_with_Bayesian forward")
         return {
             "action_loss": total_loss,
-            # "main_loss": main_loss.detach(),
-            # "prior_loss": prior_loss.detach(),
-            # "kl_loss": kl_loss.detach(),
+            # optional logs:
+            "main_loss": main_loss.detach(),
+            "prior_loss": prior_loss.detach(),
+            "kl_loss": kl_loss.detach(),
         }
 
     # ---------------------------------------------------------------------
@@ -447,7 +522,7 @@ class LangForce(baseframework):
         self,
         examples: List[dict],
         **kwargs: str,
-    ) -> np.ndarray:
+    ) -> dict:
         """
         Inference uses Posteriori branch: (V + L + action_query)
         """
@@ -464,9 +539,6 @@ class LangForce(baseframework):
                 batch_images.append([to_pil_preserve(imgs)])
 
         instructions_posteriori = [ex["lang"] + self.latent_action_query for ex in examples]
-        # instructions_posteriori = ["Just close the drawer!" + self.latent_action_query for ex in examples]
-        print(instructions_posteriori)
-
         state = [ex["state"] for ex in examples] if "state" in examples[0] else None
 
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
@@ -484,6 +556,7 @@ class LangForce(baseframework):
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
+                use_cache=False,
             )
 
             last_hidden = qwenvl_outputs.hidden_states[-1]
@@ -523,7 +596,6 @@ if __name__ == "__main__":
     model: LangForce = LangForce(cfg)
     print(model)
 
-    # fake sample
     image = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
     sample = {
         "action": np.random.uniform(-1, 1, size=(16, 7)).astype(np.float16),
@@ -540,13 +612,11 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    forward_output = model(batch)
-    action_loss = forward_output["action_loss"]
-    print(f"Action Loss: {action_loss.item()}")
+    out = model(batch)
+    print("Action Loss:", out["action_loss"].item(), "KL Loss:", out["kl_loss"].item())
 
-    predict_output = model.predict_action(examples=[sample])
-    normalized_actions = predict_output["normalized_actions"]
-    print(f"Pred Actions Shape: {normalized_actions.shape}")
+    pred = model.predict_action([sample])
+    print("Pred shape:", pred["normalized_actions"].shape)
 
     # optional dataloader test
     vla_dataset_cfg = cfg.datasets.vla_data
@@ -565,5 +635,6 @@ if __name__ == "__main__":
 
     for batch in tqdm(train_dataloader, desc="Processing Batches"):
         model(batch)
+        break
 
     print("Finished")
