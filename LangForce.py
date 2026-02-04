@@ -103,7 +103,8 @@ class LangForce(baseframework):
         self.detach_prior_cond = bool(self.config.framework.get("detach_prior_cond", True))
 
         # ===== (2) Hard-token LLR =====
-        self.use_hard_token_llr = bool(self.config.framework.get("use_hard_token_llr", True))
+        # Setting use_hard_token_llr=True yields the highest task success rates, yet it degrades the language generation quality of the VLM backbone
+        self.use_hard_token_llr = bool(self.config.framework.get("use_hard_token_llr", False))
         self.hard_token_k = int(self.config.framework.get("hard_token_k", 16))
         assert self.hard_token_k > 0
 
